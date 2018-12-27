@@ -142,6 +142,7 @@ function make_renderer() {
 		return true;
 	};
 
+	// Note that the .hlt file is in zstd format. This is the function used to open that type of file.
 	renderer.open_zstd = (filename, fail_silently) => {
 
 		if (zstd === undefined) {
@@ -322,6 +323,10 @@ function make_renderer() {
 		renderer.make_scrap_counts();
 		renderer.make_absorbed_counts();
 
+		renderer.make_ship_spawn_turn();
+		renderer.make_delivery_data();
+		renderer.make_delivery_efficiency();
+
 		renderer.set_title();
 		renderer.send_extra_stats();
 
@@ -404,7 +409,9 @@ function make_renderer() {
 			let prior_frame = renderer.frame(turn - 1);
 
 			for (let n = 0; n < prior_frame.cells.length; n++) {
-
+				
+				// the cells array in json only includes the cell which
+				// its halite has been updated.
 				let cell = prior_frame.cells[n];
 
 				let x = cell.x;
@@ -785,6 +792,178 @@ function make_renderer() {
 		}
 	};
 
+	renderer.make_ship_spawn_turn = () => {
+		// renderer.ship_spawn_turn : dict [sid] -> turn
+
+		renderer.ship_spawn_turn = {};
+		
+		for (let turn = 0; turn < renderer.game_length(); turn++) {
+
+			let events = renderer.frame(turn).events;
+
+			for (let n = 0; n < events.length; n++) {
+
+				let event = events[n];
+
+				if (event.type === "spawn") {
+					let sid = event.id
+					renderer.ship_spawn_turn[sid] = turn + 1;
+				}
+			}
+		}
+
+		for (let [sid, turn] of Object.entries(renderer.ship_spawn_turn)) {
+			console.log("spawn " + sid + " turn " + turn)
+		}
+
+	}
+
+	renderer.make_delivery_data = () => {
+
+		// renderer.deliveries : dict [sid] -> [{"turn":, "amount":}]
+
+		renderer.deliveries = {}
+
+		for (let n = 1; n < renderer.game_length(); n++) {
+
+			let this_frame = renderer.frame(n);
+			let last_frame = renderer.frame(n-1);
+
+			for (let pid = 0; pid < renderer.players(); pid++) {
+
+				let ships = this_frame.entities[pid];
+				let ships_last_frame = last_frame.entities[pid];
+
+				if (ships === undefined) {
+					continue;
+				}
+
+				if (ships_last_frame === undefined) {
+					continue;
+				}
+
+				for (let [sid, ship] of Object.entries(ships)) {
+					// if this frame is 0 halite and last frame is non-zero halite
+					// then it is a delivery
+					let ship_last_frame = ships_last_frame[sid];
+
+					// ship has just been created this frame
+					if (ship_last_frame === undefined) {
+						continue;
+					}
+
+					if (ship_last_frame.energy !== 0 && ship.energy === 0) {
+						// then this is a delivery
+						// we attempt to add it to the deliveries
+
+						// actually, it also has to be the same position as shipyard
+						let pid = renderer.sid_pid_map[sid];
+
+						let sameAsShipyardOrDropOff = false;
+						if (ship.x === renderer.game.players[pid].factory_location.x &&
+							ship.y === renderer.game.players[pid].factory_location.y) {
+								sameAsShipyardOrDropOff = true;
+						}
+						// or dropoffs
+						for (let z = 0; z < renderer.dropoff_list.length; z++) {
+
+							let dropoff = renderer.dropoff_list[z];
+	
+							if (dropoff.turn - 1 <= n && dropoff.x === ship.x && dropoff.y === ship.y) {
+								sameAsShipyardOrDropOff = true;
+							}
+						}
+
+						if (!sameAsShipyardOrDropOff) {
+							continue;
+						}
+
+
+						if (!(sid in renderer.deliveries)) {
+							renderer.deliveries[sid] = []
+						}
+
+						renderer.deliveries[sid].push({"time": n, "amount": ship_last_frame.energy})
+					}
+				}
+			}
+
+		}
+
+		for (let [sid, valueArr] of Object.entries(renderer.deliveries)) {
+			console.log(sid)
+			for (let value of valueArr) {
+				let time = value["time"]
+				let amount = value["amount"]
+				console.log(time + " " + amount)
+			}
+		}
+
+	}
+
+	renderer.make_delivery_efficiency = () => {
+		
+		renderer.deliveries_eff = []
+
+		// deliveries efficiency : [turn][player][sid] -> float
+		
+		// for each turn
+		//   for each player
+		//   for each ship still avalible to that player at that point
+		//     look up the sid in deliveries
+		//     find the turn <= current turn
+		//      -> halite, time = last index turn of spawn turn
+		//     average = halite / time
+		//     [turn]player][ship] = average
+
+		for (let n = 0; n < renderer.game_length(); n++) {
+
+			renderer.deliveries_eff.push([]);
+
+			for (let pid = 0; pid < renderer.players(); pid++) {
+
+				renderer.deliveries_eff[n].push({});
+
+				let ships = renderer.frame(n).entities[pid];
+
+				for (let [sid, ship] of Object.entries(ships)) {
+					let shipDeliveries = renderer.deliveries[sid]
+
+					if (shipDeliveries === undefined) {
+						continue;
+					}
+
+					for (let i = shipDeliveries.length - 1; i >= 0; i--) {
+
+						let time = shipDeliveries[i]["time"]
+						let amount = shipDeliveries[i]["amount"]
+
+						if (time <= n) {
+							// first delivery
+							let deliveryTime;
+							if (i == 0) {
+								deliveryTime = time - renderer.ship_spawn_turn[sid]
+							}
+							else {
+								deliveryTime = time - shipDeliveries[i-1]["time"]
+							}
+
+							let average = amount*1.0/deliveryTime
+							renderer.deliveries_eff[n][pid][sid] = average
+							if (n < 15) {
+								console.log("turn " + n + " player " + pid + " ship " + sid + " => " + average)
+							}
+							break;
+						}
+					}
+				}
+			}
+
+		}
+
+
+	}
+
 	// --------------------------------------------------------------
 
 	renderer.save = (filename) => {
@@ -1104,7 +1283,17 @@ function make_renderer() {
 		let a = highlight_box_flag ? "[" : "";
 		let b = highlight_box_flag ? "]" : "";
 
-		return `<span class="player-${ship_info.pid}-colour">${a}Ship ${sid}${mark}${b}</span> &ndash; <span class="player-${ship_info.pid}-colour">${ship_info.energy}</span> &ndash; next is <span class="player-${ship_info.pid}-colour">${renderer.ship_move(sid)}</span>`;
+		let outstr =  `<span class="player-${ship_info.pid}-colour">${a}Ship ${sid}${mark}${b}</span> &ndash; <span class="player-${ship_info.pid}-colour">${ship_info.energy}</span> &ndash; next is <span class="player-${ship_info.pid}-colour">${renderer.ship_move(sid)} </span>`;
+
+		let currentTurn = renderer.turn;
+		if (renderer.deliveries_eff[currentTurn][ship_info.pid][sid]) {
+			outstr += `<br>delivery efficiency <span class="player-${ship_info.pid}-colour">${renderer.deliveries_eff[currentTurn][ship_info.pid][sid].toFixed(2)}</span>`;
+		}
+		else {
+			outstr += '<br><br> '
+		}
+
+		return outstr
 	};
 
 	renderer.collision_string = (event) => {
@@ -1904,6 +2093,30 @@ function make_renderer() {
 			let gathered = deposited + initial;
 			let dead_ships = builds - (ships + dropoffs);
 
+			// calculate three worst delivery efficiency
+			// we do this first by creating an array of hash
+			// [{"sid":, "eff":}], and then sort it by eff
+			let effHash = renderer.deliveries_eff[renderer.turn][pid]
+			let effList = []
+			for (let [sid, deliveryEff] of Object.entries(effHash)) {
+				effList.push({"sid": sid, "eff": deliveryEff});
+			}
+			effList.sort(function compare(a, b) {
+				return a["eff"] - b["eff"];
+			});
+			let display0 = "none";
+			let display1 = "none";
+			let display2 = "none";
+			if (effList[0] !== undefined) {
+				display0 = "Ship " + effList[0]["sid"] + ": " + effList[0]["eff"];
+			}
+			if (effList[1] !== undefined) {
+				display1 = "Ship " + effList[1]["sid"] + ": " + effList[1]["eff"];
+			}
+			if (effList[2] !== undefined) {
+				display2 = "Ship " + effList[2]["sid"] + ": " + effList[2]["eff"];
+			}
+
 			let assets = (
 					ships * renderer.game.GAME_CONSTANTS.NEW_ENTITY_ENERGY_COST +
 					dropoffs * renderer.game.GAME_CONSTANTS.DROPOFF_COST +
@@ -1928,7 +2141,11 @@ function make_renderer() {
 					<li>Initial: ${c}${initial}${z}, mined: ${c}${mined}${z}, absorbed: ${c}${absorbed}${z}</li>
 					<li>Burned: ${c}${burned}${z}, carrying ${c}${carrying}${z}, dropped: ${c}${scrapped}${z}</li>
 					<li>Gathered: ${c}${gathered}${z} &ndash; spent: ${c}${spent}${z}</li>
-					<li>Profit = ${c}${current}${z} (assets: ${c}${assets}${z})</li>`
+					<li>Profit = ${c}${current}${z} (assets: ${c}${assets}${z})</li>
+					<li>Least efficient ships:</li>
+					<li>${display0}</li>
+					<li>${display1}</li>
+					<li>${display2}</li>`
 			);
 
 			if (mined + absorbed - deposited - carrying - burned - scrapped !== 0) {
